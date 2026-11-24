@@ -2789,13 +2789,26 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
-        // textures (a scene's first minutes) then drains in fewer frames.
-        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
-        }) << 20;
+        // `VICTORY_TEXTURE_STAGE_MB` overrides the auto-scaled per-frame staging
+        // budget: a backlog of tens of thousands of textures (a scene's first
+        // minutes) then drains in fewer frames.
+        static PER_FRAME_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let per_frame: u64 = PER_FRAME_MB
+            .get_or_init(|| {
+                std::env::var("VICTORY_TEXTURE_STAGE_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .map_or_else(
+                || {
+                    staging_budget_per_frame(
+                        crate::host::host()
+                            .and_then(|h| h.video_memory())
+                            .map(|[budget, ..]| budget),
+                    )
+                },
+                |mb| mb.saturating_mul(1 << 20),
+            );
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -5023,6 +5036,19 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// Per-frame texture staging byte budget scaled from the adapter's local VRAM
+/// budget (`None` keeps the 192 MiB 12 GiB baseline).
+fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match vram_budget {
+        Some(budget) if budget <= 6 * GIB => 96 * MIB,
+        Some(budget) if budget >= 20 * GIB => 384 * MIB,
+        Some(budget) if budget > 14 * GIB => 256 * MIB,
+        _ => 192 * MIB,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5084,5 +5110,21 @@ mod tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+
+    #[test]
+    fn staging_budget_scales_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(staging_budget_per_frame(None), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(4 * GIB)), 96 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(6 * GIB)), 96 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(8 * GIB)), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(12 * GIB)), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(14 * GIB)), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(16 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
     }
 }
